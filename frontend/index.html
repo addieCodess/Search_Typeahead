@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Search Typeahead</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; min-height: 100vh; display: flex; flex-direction: column; align-items: center; padding: 40px 16px; }
+    h1 { font-size: 2rem; color: #1a1a2e; margin-bottom: 8px; }
+    .subtitle { color: #666; margin-bottom: 32px; font-size: 0.95rem; }
+    .search-wrapper { position: relative; width: 100%; max-width: 580px; }
+    .search-row { display: flex; gap: 8px; }
+    #searchInput {
+      flex: 1; padding: 14px 18px; font-size: 1rem;
+      border: 2px solid #ddd; border-radius: 12px; outline: none;
+      transition: border-color 0.2s;
+    }
+    #searchInput:focus { border-color: #4f46e5; }
+    #searchBtn {
+      padding: 14px 20px; background: #4f46e5; color: #fff; border: none;
+      border-radius: 12px; cursor: pointer; font-size: 1rem; font-weight: 600;
+      transition: background 0.2s;
+    }
+    #searchBtn:hover { background: #4338ca; }
+    .ranking-toggle { display: flex; gap: 8px; margin-top: 10px; align-items: center; font-size: 0.85rem; color: #555; }
+    .ranking-toggle label { display: flex; align-items: center; gap: 4px; cursor: pointer; }
+    #dropdown {
+      position: absolute; top: calc(100% + 6px); left: 0;
+      width: calc(100% - 60px);
+      background: #fff; border: 1px solid #e0e0e0; border-radius: 12px;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.1); z-index: 100;
+      overflow: hidden; display: none;
+    }
+    .suggestion-item {
+      padding: 11px 16px; cursor: pointer; display: flex;
+      justify-content: space-between; align-items: center;
+      font-size: 0.95rem; transition: background 0.1s;
+    }
+    .suggestion-item:hover, .suggestion-item.active { background: #f0f0ff; }
+    .suggestion-item .count { font-size: 0.78rem; color: #999; }
+    .suggestion-item .score-badge { font-size: 0.75rem; background: #e0e7ff; color: #4f46e5; padding: 2px 7px; border-radius: 20px; }
+    #result { margin-top: 16px; padding: 12px 18px; background: #fff; border-radius: 12px; border: 1px solid #e0e0e0; display: none; font-size: 0.95rem; color: #333; max-width: 580px; width: 100%; }
+    #metrics-bar { margin-top: 8px; font-size: 0.78rem; color: #888; max-width: 580px; width: 100%; }
+    .trending-section { margin-top: 36px; max-width: 580px; width: 100%; }
+    .trending-section h2 { font-size: 1rem; color: #444; margin-bottom: 12px; display: flex; align-items: center; gap: 6px; }
+    .trending-list { display: flex; flex-wrap: wrap; gap: 8px; }
+    .trending-chip {
+      padding: 6px 14px; background: #fff; border: 1px solid #ddd;
+      border-radius: 20px; font-size: 0.85rem; cursor: pointer;
+      transition: all 0.15s; color: #333;
+    }
+    .trending-chip:hover { background: #4f46e5; color: #fff; border-color: #4f46e5; }
+    .loading { color: #aaa; font-style: italic; font-size: 0.85rem; padding: 10px 16px; }
+    .error { color: #e53e3e; font-size: 0.85rem; padding: 10px 16px; }
+  </style>
+</head>
+<body>
+  <h1>🔍 Search Typeahead</h1>
+  <p class="subtitle">Distributed cache · Consistent hashing · Batch writes · Trending</p>
+
+  <div class="search-wrapper">
+    <div class="search-row">
+      <input id="searchInput" type="text" placeholder="Start typing…" autocomplete="off" />
+      <button id="searchBtn">Search</button>
+    </div>
+    <div class="ranking-toggle">
+      Ranking:
+      <label><input type="radio" name="ranking" value="count" checked /> Historical count</label>
+      <label><input type="radio" name="ranking" value="recency" /> Recency-boosted</label>
+    </div>
+    <div id="dropdown"></div>
+  </div>
+
+  <div id="result"></div>
+  <div id="metrics-bar"></div>
+
+  <div class="trending-section">
+    <h2>🔥 Trending now</h2>
+    <div class="trending-list" id="trendingList"><span class="loading">Loading…</span></div>
+  </div>
+
+  <script>
+    const API = 'http://localhost:8000';
+    let debounceTimer = null;
+    let activeIdx = -1;
+    let currentSuggestions = [];
+
+    const input = document.getElementById('searchInput');
+    const dropdown = document.getElementById('dropdown');
+    const resultBox = document.getElementById('result');
+    const metricsBar = document.getElementById('metrics-bar');
+    const trendingList = document.getElementById('trendingList');
+
+    function getRanking() {
+      return document.querySelector('input[name="ranking"]:checked').value;
+    }
+
+    input.addEventListener('input', () => {
+      clearTimeout(debounceTimer);
+      activeIdx = -1;
+      const q = input.value.trim();
+      if (!q) { hideDropdown(); return; }
+      debounceTimer = setTimeout(() => fetchSuggestions(q), 200);
+    });
+
+    input.addEventListener('keydown', e => {
+      const items = dropdown.querySelectorAll('.suggestion-item');
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        activeIdx = Math.min(activeIdx + 1, items.length - 1);
+        items.forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        activeIdx = Math.max(activeIdx - 1, -1);
+        items.forEach((el, i) => el.classList.toggle('active', i === activeIdx));
+      } else if (e.key === 'Enter') {
+        if (activeIdx >= 0 && items[activeIdx]) {
+          const text = currentSuggestions[activeIdx]?.text;
+          if (text) { input.value = text; hideDropdown(); submitSearch(text); }
+        } else {
+          submitSearch(input.value.trim());
+        }
+      } else if (e.key === 'Escape') {
+        hideDropdown();
+      }
+    });
+
+    document.addEventListener('click', e => {
+      if (!e.target.closest('.search-wrapper')) hideDropdown();
+    });
+
+    document.getElementById('searchBtn').addEventListener('click', () => {
+      submitSearch(input.value.trim());
+    });
+
+    document.querySelectorAll('input[name="ranking"]').forEach(r => {
+      r.addEventListener('change', () => {
+        const q = input.value.trim();
+        if (q) fetchSuggestions(q);
+      });
+    });
+
+    async function fetchSuggestions(q) {
+      dropdown.innerHTML = '<div class="loading">Loading…</div>';
+      dropdown.style.display = 'block';
+      try {
+        const res = await fetch(`${API}/suggest?q=${encodeURIComponent(q)}&ranking=${getRanking()}`);
+        const data = await res.json();
+        currentSuggestions = data.suggestions || [];
+        renderSuggestions(currentSuggestions, data);
+      } catch {
+        dropdown.innerHTML = '<div class="error">Could not reach backend</div>';
+      }
+    }
+
+    function renderSuggestions(suggestions, meta) {
+      if (!suggestions.length) { dropdown.innerHTML = '<div class="loading">No results</div>'; return; }
+      const isRecency = getRanking() === 'recency';
+      dropdown.innerHTML = suggestions.map((s, i) => `
+        <div class="suggestion-item" data-idx="${i}">
+          <span>${highlight(s.text, input.value.trim())}</span>
+          <span>
+            ${isRecency && s.score !== undefined ? `<span class="score-badge">score ${Math.round(s.score).toLocaleString()}</span>` : ''}
+            <span class="count">${s.count.toLocaleString()} searches</span>
+          </span>
+        </div>
+      `).join('');
+      metricsBar.textContent = `${meta.cache_hit ? '✅ cache hit' : '❌ cache miss'} · ${meta.latency_ms}ms · ranking: ${meta.ranking}`;
+      dropdown.querySelectorAll('.suggestion-item').forEach(el => {
+        el.addEventListener('mousedown', e => {
+          e.preventDefault();
+          const idx = parseInt(el.dataset.idx);
+          const text = currentSuggestions[idx]?.text;
+          if (text) { input.value = text; hideDropdown(); submitSearch(text); }
+        });
+      });
+    }
+
+    function highlight(text, prefix) {
+      if (!prefix) return text;
+      const escaped = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      return text.replace(new RegExp(`^(${escaped})`, 'i'), '<strong>$1</strong>');
+    }
+
+    function hideDropdown() {
+      dropdown.style.display = 'none';
+      dropdown.innerHTML = '';
+      activeIdx = -1;
+      currentSuggestions = [];
+    }
+
+    async function submitSearch(q) {
+      if (!q) return;
+      hideDropdown();
+      resultBox.style.display = 'block';
+      resultBox.textContent = 'Searching…';
+      try {
+        const res = await fetch(`${API}/search`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ query: q })
+        });
+        const data = await res.json();
+        resultBox.innerHTML = `<strong>${data.message}</strong> — "<em>${data.query}</em>" · total count: ${data.count.toLocaleString()}`;
+        fetchTrending();
+      } catch {
+        resultBox.textContent = 'Search failed — is the backend running?';
+      }
+    }
+
+    async function fetchTrending() {
+      try {
+        const res = await fetch(`${API}/trending?limit=10`);
+        const data = await res.json();
+        trendingList.innerHTML = data.trending.map(t =>
+          `<span class="trending-chip" title="${t.count.toLocaleString()} searches">${t.text}</span>`
+        ).join('');
+        trendingList.querySelectorAll('.trending-chip').forEach(chip => {
+          chip.addEventListener('click', () => {
+            input.value = chip.textContent;
+            fetchSuggestions(chip.textContent);
+            input.focus();
+          });
+        });
+      } catch {
+        trendingList.innerHTML = '<span class="error">Could not load trending</span>';
+      }
+    }
+
+    fetchTrending();
+    setInterval(fetchTrending, 15000);
+  </script>
+</body>
+</html>
